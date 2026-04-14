@@ -1,7 +1,12 @@
 /****************************************************
  * MIKADO SPORTS ▪ PRONOS — COMPOS ULTRA OPTIMISÉES
- * Mode C — Réduction extrême des appels API (–80%)
- * Cache quotidien + cache mémoire + anti-doublon
+ * Version BOXSCORE — Partie 1/4
+ * - Constantes
+ * - Caches
+ * - Helpers
+ * - smartFetch()
+ * - fetchLanding()
+ * - fetchBoxscore()  ← source officielle NHL
  ****************************************************/
 
 let _composLoaded = false;
@@ -9,6 +14,7 @@ let _composLoaded = false;
 // 🧠 Cache mémoire (réinitialisé à chaque session)
 const lastGameCache = {};     // teamAbbrev → lastGameId
 const landingCache = {};      // gameId → landing JSON
+const boxscoreCache = {};     // gameId → boxscore JSON
 const lineupCache = {};       // gameId → lineup construit
 
 // 🗓 Cache localStorage (réinitialisé chaque jour)
@@ -45,7 +51,7 @@ async function smartFetch(url) {
 }
 
 /****************************************************
- * LANDING CACHE — évite les appels doublons
+ * LANDING CACHE — fallback secondaire
  ****************************************************/
 async function fetchLanding(gameId) {
   if (landingCache[gameId]) return landingCache[gameId];
@@ -56,330 +62,356 @@ async function fetchLanding(gameId) {
 }
 
 /****************************************************
- * LAST GAME ID CACHE — évite 2 appels par équipe
+ * BOXSCORE — SOURCE OFFICIELLE NHL (BLOC 1)
  ****************************************************/
-async function getLastGameId(teamAbbrev) {
-  if (lastGameCache[teamAbbrev]) return lastGameCache[teamAbbrev];
+async function fetchBoxscore(gameId) {
+  if (boxscoreCache[gameId]) return boxscoreCache[gameId];
 
+  const url = `${NHL_API.replace('/v1','')}/v1/gamecenter/${gameId}/boxscore`;
+
+  const urls = [
+    url,
+    `${WORKER}?url=${encodeURIComponent(url)}`
+  ];
+
+  let lastErr = null;
+
+  for (const u of urls) {
+    try {
+      const r = await fetch(u, { signal: AbortSignal.timeout(5000) });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+
+      const data = await r.json();
+
+      const hasLineups =
+        data?.boxscore?.teams?.home?.forwards?.length ||
+        data?.boxscore?.teams?.away?.forwards?.length;
+
+      if (hasLineups) {
+        boxscoreCache[gameId] = data;
+        return data;
+      }
+
+      lastErr = new Error("Boxscore sans lineups");
+    } catch (e) {
+      lastErr = e;
+      console.warn("fetchBoxscore échoué:", u, e.message);
+    }
+  }
+
+  throw lastErr || new Error("Impossible de charger le boxscore");
+}
+/****************************************************
+ * PARTIE 2/4 — LOGIQUE COMPOS
+ * - Extraction BOXSCORE (officielle)
+ * - Fallback LANDING
+ * - Fallback dernier match
+ * - Fonction getBestLineup()
+ ****************************************************/
+
+/****************************************************
+ * Extraction depuis BOXSCORE (officielle)
+ ****************************************************/
+function extractFromBoxscore(data) {
   try {
-    const data = await smartFetch(`${NHL_API}/club-schedule/${teamAbbrev}/month/now`);
-    const games = data.games || [];
+    const home = data?.boxscore?.teams?.home;
+    const away = data?.boxscore?.teams?.away;
 
-    const finished = games.filter(g =>
-      g.gameState === 'OFF' ||
-      g.gameState === 'FINAL' ||
-      g.gameState === 'OVER'
-    );
+    if (!home || !away) return null;
 
-    if (!finished.length) return null;
-
-    finished.sort((a, b) => new Date(b.gameDate) - new Date(a.gameDate));
-
-    lastGameCache[teamAbbrev] = finished[0].id;
-    return finished[0].id;
-
-  } catch (e) {
-    console.warn("Erreur lastGameId:", teamAbbrev, e.message);
+    return {
+      away: {
+        forwards: away.forwards || [],
+        defense: away.defense || [],
+        goalies: away.goalies || []
+      },
+      home: {
+        forwards: home.forwards || [],
+        defense: home.defense || [],
+        goalies: home.goalies || []
+      },
+      status: "official"
+    };
+  } catch {
     return null;
   }
 }
 
 /****************************************************
- * CHARGEMENT PRINCIPAL DES COMPOS
+ * Extraction depuis LANDING (fallback secondaire)
  ****************************************************/
-async function loadCompos() {
-  const container = document.getElementById('compos-container');
-  const statusMsg = document.getElementById('compos-status-msg');
-  const spinner = document.getElementById('compos-spinner');
-
-  const cacheKey = getDailyCacheKey();
-  const cached = localStorage.getItem(cacheKey);
-
-  // ⚡ Affichage immédiat du cache (provisoire)
-  if (cached) {
-    container.innerHTML = cached;
-    statusMsg.textContent = 'Compositions provisoires (cache) — ' + fmt(today());
-  } else {
-    spinner.style.display = 'block';
-    statusMsg.textContent = 'Chargement des compositions...';
-  }
-
-  // 🔥 On continue quand même pour charger les officielles
+function extractFromLanding(data) {
   try {
-    const schedule = await smartFetch(`${NHL_API}/schedule/${today()}`);
-    const games = schedule?.gameWeek?.[0]?.games || [];
+    const away = data?.awayTeam;
+    const home = data?.homeTeam;
 
-    if (!games.length) {
-      container.innerHTML = `
-        <div class="empty">
-          <span class="big">0</span>Aucun match prévu
-        </div>`;
-      spinner.style.display = 'none';
-      statusMsg.textContent = 'Aucun match aujourd\'hui';
-      return;
-    }
+    if (!away || !home) return null;
 
-    container.innerHTML = '<div class="compo-grid" id="compo-grid"></div>';
-    const grid = document.getElementById('compo-grid');
+    const af = away.forwards || [];
+    const ad = away.defensemen || [];
+    const ag = away.goalies || [];
 
-    // 🔄 Chargement parallèle ultra-rapide
-    for (const game of games) {
-      const away = game.awayTeam;
-      const home = game.homeTeam;
+    const hf = home.forwards || [];
+    const hd = home.defensemen || [];
+    const hg = home.goalies || [];
 
-      const gt = game.startTimeUTC
-        ? new Date(game.startTimeUTC).toLocaleTimeString('fr-CA', {
-            hour: '2-digit',
-            minute: '2-digit',
-            timeZone: 'America/Toronto'
-          })
-        : '';
+    if (!af.length && !hf.length) return null;
 
-      const card = document.createElement('div');
-      card.className = 'compo-card';
-
-      card.innerHTML = `
-        <div class="compo-card-header">
-          <div>
-            <div class="compo-match-title">${away.abbrev} @ ${home.abbrev}</div>
-            <div style="font-size:11px;color:var(--muted);font-family:Barlow Condensed,sans-serif;">
-              ${gt} HE
-            </div>
-          </div>
-          <div class="compo-match-status status-wait" id="cs_${game.id}">
-            ⏳ Chargement
-          </div>
-        </div>
-        <div class="compo-teams" id="cl_${game.id}">
-          <div class="compo-pending">Récupération...</div>
-        </div>
-      `;
-
-      grid.appendChild(card);
-
-      // 🔥 Chargement de la lineup (officielle → provisoire)
-      loadLineup(game.id, away, home);
-    }
-
-  } catch (e) {
-    container.innerHTML = `
-      <div class="empty" style="color:var(--red)">
-        Erreur: ${e.message}
-      </div>`;
+    return {
+      away: { forwards: af, defense: ad, goalies: ag },
+      home: { forwards: hf, defense: hd, goalies: hg },
+      status: "landing"
+    };
+  } catch {
+    return null;
   }
-
-  spinner.style.display = 'none';
-  statusMsg.textContent = 'Compositions — ' + fmt(today());
 }
-/****************************************************
- * CHARGEMENT DES LINEUPS (OFFICIELLE → PROVISOIRE)
- ****************************************************/
-async function loadLineup(gameId, away, home) {
-  const linesDiv = document.getElementById('cl_' + gameId);
-  const statusEl = document.getElementById('cs_' + gameId);
 
-  // ⚡ Anti-doublon : lineup déjà construite
-  if (lineupCache[gameId]) {
-    linesDiv.innerHTML = lineupCache[gameId].html;
-    statusEl.textContent = lineupCache[gameId].status;
-    statusEl.className = lineupCache[gameId].className;
-    return;
+/****************************************************
+ * Extraction depuis le dernier match (fallback final)
+ ****************************************************/
+async function extractFromLastGame(teamAbbrev) {
+  try {
+    const lastId = await getLastGameId(teamAbbrev);
+    if (!lastId) return null;
+
+    const data = await fetchLanding(lastId);
+
+    const isHome = data?.homeTeam?.abbrev === teamAbbrev;
+    const t = isHome ? data.homeTeam : data.awayTeam;
+
+    return {
+      forwards: t?.forwards || [],
+      defense: t?.defensemen || [],
+      goalies: t?.goalies || []
+    };
+  } catch {
+    return null;
+  }
+}
+
+/****************************************************
+ * getBestLineup(gameId, away, home)
+ * - 1) BOXSCORE (officielle)
+ * - 2) LANDING (fallback)
+ * - 3) LAST GAME (fallback final)
+ ****************************************************/
+async function getBestLineup(gameId, away, home) {
+
+  /***********************
+   * 1️⃣ BOXSCORE OFFICIEL
+   ***********************/
+  try {
+    const box = await fetchBoxscore(gameId);
+    const parsed = extractFromBoxscore(box);
+    if (parsed) return parsed;
+  } catch (e) {
+    console.warn("Boxscore indisponible:", e.message);
   }
 
-  /****************************************************
-   * 1️⃣ ESSAI : COMPO OFFICIELLE DU MATCH DU JOUR
-   ****************************************************/
+  /***********************
+   * 2️⃣ LANDING (fallback)
+   ***********************/
   try {
-    const data = await fetchLanding(gameId);
+    const land = await fetchLanding(gameId);
+    const parsed = extractFromLanding(land);
+    if (parsed) return parsed;
+  } catch (e) {
+    console.warn("Landing indisponible:", e.message);
+  }
 
-    const af = data?.awayTeam?.forwards || [];
-    const ad = data?.awayTeam?.defensemen || [];
-    const ag = data?.awayTeam?.goalies || [];
+  /***********************
+   * 3️⃣ DERNIER MATCH
+   ***********************/
+  try {
+    const awayLast = await extractFromLastGame(away.abbrev);
+    const homeLast = await extractFromLastGame(home.abbrev);
 
-    const hf = data?.homeTeam?.forwards || [];
-    const hd = data?.homeTeam?.defensemen || [];
-    const hg = data?.homeTeam?.goalies || [];
-
-    if (af.length > 0 || hf.length > 0) {
-      const html = buildTeams(away.abbrev, home.abbrev, af, ad, ag, hf, hd, hg);
-
-      linesDiv.innerHTML = html;
-      statusEl.textContent = '✓ Confirmée';
-      statusEl.className = 'compo-match-status status-ok';
-
-      lineupCache[gameId] = {
-        html,
-        status: '✓ Confirmée',
-        className: 'compo-match-status status-ok'
+    if (awayLast || homeLast) {
+      return {
+        away: awayLast || { forwards: [], defense: [], goalies: [] },
+        home: homeLast || { forwards: [], defense: [], goalies: [] },
+        status: "lastgame"
       };
-
-      updateCompoCache();
-      return;
     }
   } catch (e) {
-    console.warn("Erreur officielle:", gameId, e.message);
+    console.warn("Dernier match indisponible:", e.message);
   }
 
-  /****************************************************
-   * 2️⃣ ESSAI : COMPO PROVISOIRE (DERNIER MATCH)
-   ****************************************************/
+  /***********************
+   * 4️⃣ AUCUNE COMPO
+   ***********************/
+  return {
+    away: { forwards: [], defense: [], goalies: [] },
+    home: { forwards: [], defense: [], goalies: [] },
+    status: "none"
+  };
+}
+/****************************************************
+ * PARTIE 3/4 — AUTO‑REFRESH INTELLIGENT
+ * - Refresh toutes les 45s si match en cours
+ * - Stop dès que l’officielle tombe
+ * - Jamais de refresh inutile
+ ****************************************************/
+
+let refreshTimer = null;
+
+/****************************************************
+ * Détermine si le match est en cours
+ ****************************************************/
+function isGameLive(gameState) {
+  return ["LIVE", "CRIT", "PRE_GAME", "IN_PROGRESS"].includes(gameState);
+}
+
+/****************************************************
+ * Lance le refresh automatique
+ ****************************************************/
+function startAutoRefresh(gameId, away, home, gameState) {
+  // Si déjà actif → ne pas doubler
+  if (refreshTimer) return;
+
+  // Match pas en cours → pas de refresh
+  if (!isGameLive(gameState)) return;
+
+  console.log("🔄 Auto-refresh activé pour le match", gameId);
+
+  refreshTimer = setInterval(async () => {
+    try {
+      console.log("🔄 Refresh compos…");
+
+      const lineup = await getBestLineup(gameId, away, home);
+
+      // Si l’officielle tombe → stop refresh
+      if (lineup.status === "official") {
+        console.log("🟢 Officielle détectée → arrêt du refresh");
+        stopAutoRefresh();
+      }
+
+      // Mise à jour visuelle immédiate
+      renderLineup(lineup, away, home);
+
+      // Mise à jour du cache quotidien
+      saveDailyCache(lineup);
+
+    } catch (e) {
+      console.warn("Erreur refresh:", e.message);
+    }
+  }, 45000); // 45 secondes
+}
+
+/****************************************************
+ * Stoppe le refresh automatique
+ ****************************************************/
+function stopAutoRefresh() {
+  if (refreshTimer) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+}
+
+/****************************************************
+ * Sauvegarde du cache quotidien
+ ****************************************************/
+function saveDailyCache(lineup) {
   try {
-    const awayLastId = await getLastGameId(away.abbrev);
-    const homeLastId = await getLastGameId(home.abbrev);
-
-    let af2 = [], ad2 = [], ag2 = [];
-    let hf2 = [], hd2 = [], hg2 = [];
-
-    if (awayLastId) {
-      try {
-        const awayData = await fetchLanding(awayLastId);
-        const awayWasHome = awayData?.homeTeam?.abbrev === away.abbrev;
-        const awayTeamData = awayWasHome ? awayData.homeTeam : awayData.awayTeam;
-
-        af2 = awayTeamData?.forwards || [];
-        ad2 = awayTeamData?.defensemen || [];
-        ag2 = awayTeamData?.goalies || [];
-      } catch (e) {}
-    }
-
-    if (homeLastId) {
-      try {
-        const homeData = await fetchLanding(homeLastId);
-        const homeWasHome = homeData?.homeTeam?.abbrev === home.abbrev;
-        const homeTeamData = homeWasHome ? homeData.homeTeam : homeData.awayTeam;
-
-        hf2 = homeTeamData?.forwards || [];
-        hd2 = homeTeamData?.defensemen || [];
-        hg2 = homeTeamData?.goalies || [];
-      } catch (e) {}
-    }
-
-    if (af2.length > 0 || hf2.length > 0) {
-      const html = buildTeams(away.abbrev, home.abbrev, af2, ad2, ag2, hf2, hd2, hg2);
-
-      linesDiv.innerHTML = html;
-      statusEl.textContent = '⚠ Provisoire';
-      statusEl.className = 'compo-match-status status-prov';
-
-      lineupCache[gameId] = {
-        html,
-        status: '⚠ Provisoire',
-        className: 'compo-match-status status-prov'
-      };
-
-      updateCompoCache();
-      return;
-    }
+    const key = getDailyCacheKey();
+    localStorage.setItem(key, JSON.stringify(lineup));
   } catch (e) {
-    console.warn("Erreur provisoire:", gameId, e.message);
+    console.warn("Impossible de sauvegarder le cache:", e.message);
   }
-
-  /****************************************************
-   * 3️⃣ AUCUNE COMPO DISPONIBLE
-   ****************************************************/
-  linesDiv.innerHTML = '<div class="compo-pending">Composition non disponible</div>';
-  statusEl.textContent = '⏳ À venir';
-  statusEl.className = 'compo-match-status status-wait';
 }
 
 /****************************************************
- * MISE À JOUR DU CACHE QUOTIDIEN
+ * Rendu visuel (sera utilisé dans loadLineup)
  ****************************************************/
-function updateCompoCache() {
-  const grid = document.getElementById('compo-grid');
-  if (!grid) return;
+function renderLineup(lineup, away, home) {
+  const container = document.getElementById("compos-container");
+  if (!container) return;
 
-  const cacheKey = getDailyCacheKey();
-  localStorage.setItem(cacheKey, grid.outerHTML);
+  container.innerHTML = buildTeams(lineup, away, home);
+}
+/****************************************************
+ * PARTIE 4/4 — LOADLINEUP + BUILD UI
+ ****************************************************/
+
+/****************************************************
+ * Fonction principale : charge et affiche les compos
+ ****************************************************/
+async function loadLineup(gameId, away, home, gameState) {
+  try {
+    // 1) Charger la meilleure compo (boxscore → landing → lastgame)
+    const lineup = await getBestLineup(gameId, away, home);
+
+    // 2) Rendu visuel
+    renderLineup(lineup, away, home);
+
+    // 3) Sauvegarde cache quotidien
+    saveDailyCache(lineup);
+
+    // 4) Auto-refresh si match en cours
+    startAutoRefresh(gameId, away, home, gameState);
+
+  } catch (e) {
+    console.error("Erreur loadLineup:", e.message);
+  }
 }
 
 /****************************************************
- * CONSTRUCTION DES BLOCS VISITEURS / DOMICILE
+ * Construction VISUELLE
  ****************************************************/
-function buildTeams(aa, ha, af, ad, ag, hf, hd, hg) {
+function buildTeams(lineup, away, home) {
   return `
-    <div class="compo-team-panel">
-      <div class="compo-team-header">
-        ${aa} <span style="font-size:10px;color:var(--muted);font-weight:400">✈ VISITEURS</span>
+    <div class="teams-wrapper">
+      <div class="team-block">
+        <h2>${away.name} (${away.abbrev})</h2>
+        ${buildLineup(lineup.away)}
       </div>
-      ${buildLineup(af, ad, ag)}
-    </div>
 
-    <div class="compo-team-panel">
-      <div class="compo-team-header">
-        ${ha} <span style="font-size:10px;color:var(--muted);font-weight:400">🏠 DOMICILE</span>
+      <div class="team-block">
+        <h2>${home.name} (${home.abbrev})</h2>
+        ${buildLineup(lineup.home)}
       </div>
-      ${buildLineup(hf, hd, hg)}
     </div>
   `;
 }
 
 /****************************************************
- * CONSTRUCTION DES LIGNES / PAIRES / GOALIES
+ * Construction d’une compo (forwards / defense / goalies)
  ****************************************************/
-function buildLineup(fwds, defs, goalies) {
-  if (!fwds.length && !defs.length)
-    return '<div class="compo-pending">Non disponible</div>';
-
-  let h = '';
-
-  // Lignes d'attaque
-  for (let i = 0; i < Math.min(fwds.length, 12); i += 3) {
-    const line = fwds.slice(i, i + 3);
-    h += `
-      <div class="compo-line-title">— Ligne ${Math.floor(i / 3) + 1} —</div>
-      <div class="compo-players-row">
-        ${line.map(p => pSlot(p, (p.positionCode || 'C').toLowerCase())).join('')}
-      </div>
-      <hr class="compo-divider">
-    `;
-  }
-
-  // Paires défensives
-  for (let i = 0; i < Math.min(defs.length, 6); i += 2) {
-    const pair = defs.slice(i, i + 2);
-    h += `
-      <div class="compo-line-title">— Paire ${Math.floor(i / 2) + 1} —</div>
-      <div class="compo-players-row">
-        ${pair.map(p => pSlot(p, 'd')).join('')}
-      </div>
-      <hr class="compo-divider">
-    `;
-  }
-
-  // Gardien
-  if (goalies.length) {
-    h += `
-      <div class="compo-goalie-zone">
-        ${pSlot(goalies[0], 'g')}
-      </div>
-    `;
-  }
-
-  return h;
-}
-
-/****************************************************
- * SLOT JOUEUR (photo + nom + position)
- ****************************************************/
-function pSlot(p, cls) {
-  const pid = p.id || '';
-  const name = (p.lastName?.default) || (p.name?.default) || '?';
-  const init = name.charAt(0);
-
+function buildLineup(team) {
   return `
-    <div class="compo-player-slot">
-      <div class="compo-photo-wrap ${cls}">
-        <img src="https://assets.nhle.com/mugs/nhl/20252026/${pid}.png"
-             onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"
-             loading="lazy">
-        <span class="compo-photo-initial" style="display:none">${init}</span>
-      </div>
-      <div class="compo-player-name">${name}</div>
-      <div class="compo-player-pos">${cls.toUpperCase()}</div>
+    <div class="lineup-section">
+      <h3>Attaquants</h3>
+      ${team.forwards.map(p => pSlot(p)).join("")}
+    </div>
+
+    <div class="lineup-section">
+      <h3>Défenseurs</h3>
+      ${team.defense.map(p => pSlot(p)).join("")}
+    </div>
+
+    <div class="lineup-section">
+      <h3>Gardiens</h3>
+      ${team.goalies.map(p => pSlot(p)).join("")}
     </div>
   `;
 }
 
-// Init date display
-document.getElementById('header-date').textContent = fmt(today());
+/****************************************************
+ * Slot joueur
+ ****************************************************/
+function pSlot(p) {
+  if (!p) return "";
+
+  const num = p.sweaterNumber ? `#${p.sweaterNumber}` : "";
+  const pos = p.positionCode || "";
+  const name = p.firstName?.default + " " + p.lastName?.default;
+
+  return `
+    <div class="player-slot">
+      <span class="player-num">${num}</span>
+      <span class="player-name">${name}</span>
+      <span class="player-pos">${pos}</span>
+    </div>
+  `;
+}
