@@ -93,3 +93,7 @@ function renderAllMatches(allMatchesData) {
     container.appendChild(section);
   }
 }
+
+/* 🔥 Correction essentielle : rendre les fonctions globales */
+window.loadAll = loadAll;
+window.renderAllMatches = renderAllMatches;
